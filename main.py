@@ -24,7 +24,6 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 
-
 def prepare_dir(path):
     if os.path.exists(path):
         shutil.rmtree(path)
@@ -97,6 +96,8 @@ def analyze_with_ai(tender_title, full_text):
 
     print("  🤖 Надсилаємо документацію на аналіз у Gemini...")
     
+    text_snippet = full_text[:80000]
+    
     prompt = f"""
     Ти — експерт з аналізу польських публічних закупівель (PZP/SWZ). 
     Проаналізуй надану тендерну документацію для тендера "{tender_title}" і надай детальний, структурований звіт українською мовою.
@@ -110,26 +111,23 @@ def analyze_with_ai(tender_title, full_text):
     6. **Особливі примітки/Ризики**: Договірні штрафи, специфічні вимоги до логістики чи упаковки.
 
     Ось текст тендерної документації:
-    {full_text[:10000]}
+    {text_snippet}
     """
 
-    # Автоматичний перебір моделей, якщо одна з них недоступна
-    candidate_models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash']
+    # Оновлено актуальні моделі згідно з вимогами API
+    candidate_models = ['gemini-3.6-flash', 'gemini-1.5-flash-latest']
     response = None
 
     for model_name in candidate_models:
         try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-            )
-            break
+            chat = client.chats.create(model=model_name)
+            response = chat.send_message(prompt)
+            if response and response.text:
+                print(f"  ✅ Отримано відповідь від моделі: {model_name}")
+                break
         except Exception as err:
-            if "404" in str(err) or "NOT_FOUND" in str(err):
-                continue
-            else:
-                print(f"  ❌ Помилка при запиті до AI ({model_name}): {err}")
-                return
+            print(f"  ⚠️ Модель {model_name} повернула помилку: {err}")
+            continue
 
     if response and response.text:
         safe_title = "".join([c if c.isalnum() else "_" for c in tender_title[:30]])
@@ -151,7 +149,6 @@ async def process_tenders_for_keyword(page, keyword):
         )
         await page.wait_for_timeout(2000)
 
-        # Пошук за ключовим словом
         search_input = page.locator("input[type='text']").first
         if await search_input.is_visible():
             await search_input.fill(keyword)
@@ -162,9 +159,8 @@ async def process_tenders_for_keyword(page, keyword):
                 await page.keyboard.press("Enter")
             await page.wait_for_timeout(3000)
 
-        # Очікуємо появу таблиці з результатами
         try:
-            await page.wait_for_selector("table tbody tr", timeout=10000)
+            await page.wait_for_selector("table tbody tr", timeout=15000)
         except Exception:
             print(f"  ℹ️ За ключовим словом '{keyword}' тендерів не знайдено.")
             return
@@ -181,7 +177,6 @@ async def process_tenders_for_keyword(page, keyword):
         limit = min(count, 5)
         for idx in range(limit):
             try:
-                # Повернення до списку після першого тендера
                 if idx > 0:
                     await page.goto(
                         "https://tw.ezamawiajacy.pl/pn/tw/demand/notice/publicpzp/current/list?USER_MENU_HOVER=publicpzpCurrentNoticePublicList",
@@ -199,16 +194,22 @@ async def process_tenders_for_keyword(page, keyword):
                             await page.keyboard.press("Enter")
                         await page.wait_for_timeout(3000)
 
-                # Явно чекаємо завантаження таблиці перед вибором рядка
-                await page.wait_for_selector("table tbody tr", timeout=10000)
+                await page.wait_for_selector("table tbody tr", timeout=15000)
                 row = page.locator("table tbody tr").nth(idx)
                 
-                # Знаходимо текст у першій (номер) або другій (назва) комірці
-                target_element = row.locator("td a").first
-                if not await target_element.is_visible():
-                    target_element = row.locator("td").nth(1)
-                if not await target_element.is_visible():
-                    target_element = row.locator("td").first
+                # Покращений пошук посилання у будь-якій комірці рядка
+                target_element = None
+                links = row.locator("a")
+                if await links.count() > 0:
+                    target_element = links.first
+                else:
+                    tds = row.locator("td")
+                    if await tds.count() > 0:
+                        target_element = tds.first
+
+                if not target_element or not await target_element.is_visible():
+                    print(f"  ⚠️ Не вдалося знайти елемент для кліку в рядку [{idx+1}]. Пропускаємо.")
+                    continue
 
                 tender_title = await target_element.inner_text()
                 tender_title = tender_title.strip().replace("\n", " ")
@@ -217,7 +218,6 @@ async def process_tenders_for_keyword(page, keyword):
                 tender_dir = os.path.join(BASE_DOWNLOAD_DIR, f"tender_{keyword}_{idx+1}")
                 prepare_dir(tender_dir)
 
-                # Клік через JS
                 try:
                     await target_element.evaluate("el => el.click()")
                 except Exception:
@@ -225,7 +225,6 @@ async def process_tenders_for_keyword(page, keyword):
 
                 await page.wait_for_timeout(4000)
 
-                # Перехід у розділ документів
                 for tab_name in ["Załączniki", "Dokumenty zamówienia", "Dokumenty", "Dokumentacja"]:
                     tab = page.locator(f"text={tab_name}").first
                     if await tab.is_visible():
@@ -234,14 +233,12 @@ async def process_tenders_for_keyword(page, keyword):
                         await page.wait_for_timeout(3000)
                         break
 
-                # Виділення чекбокса 'Вибрати все'
                 checkbox = page.locator("table th input[type='checkbox'], table th").first
                 if await checkbox.is_visible():
                     print("  ☑️ Натискаємо 'Вибрати все'...")
                     await checkbox.click(force=True)
                     await page.wait_for_timeout(1500)
 
-                # Завантаження документів
                 pobierz_btn = page.locator(
                     "button:has-text('POBIERZ'), "
                     "a:has-text('POBIERZ'), "
